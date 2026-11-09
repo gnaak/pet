@@ -12,19 +12,20 @@
 #include <ArduinoJson.h>
 #include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
-#include <ESP8266HTTPUpdateServer.h>
+#include <Updater.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <SPI.h>
 #include <WiFiClientSecureBearSSL.h>
+#include <base64.h>
 #include <time.h>
 
 #include "assets.h"
 
 namespace {
 
-constexpr const char* VERSION = "v0.14";
+constexpr const char* VERSION = "v0.18";
 constexpr const char* HOSTNAME = "pet";        // http://pet.local
 constexpr const char* SETUP_AP = "pet-setup";  // 와이파이를 못 찾으면 띄우는 와이파이 이름 (비밀번호 없음)
 constexpr uint32_t WIFI_WAIT_MS = 20000;
@@ -105,17 +106,28 @@ constexpr uint8_t EEPROM_MAGIC = 0x5B;
 Theme theme = TH_PET;
 Mode mode = MODE_AUTO;
 
+constexpr int TOSS_ID_AT = 16, TOSS_ID_LEN = 64, TOSS_SECRET_AT = 80, TOSS_SECRET_LEN = 96;
+char tossId[TOSS_ID_LEN] = "";          // 토스증권 Open API 키 - 기기에만 저장하고 페이지에 보이지 않는다
+char tossSecret[TOSS_SECRET_LEN] = "";
+
 void loadSettings() {
-  EEPROM.begin(16);
+  EEPROM.begin(256);
   if (EEPROM.read(0) != EEPROM_MAGIC) return;
   if (EEPROM.read(1) < TH_COUNT) theme = static_cast<Theme>(EEPROM.read(1));
   if (EEPROM.read(2) <= MODE_DARK) mode = static_cast<Mode>(EEPROM.read(2));
+  for (int i = 0; i < TOSS_ID_LEN; i++) tossId[i] = static_cast<char>(EEPROM.read(TOSS_ID_AT + i));
+  for (int i = 0; i < TOSS_SECRET_LEN; i++) tossSecret[i] = static_cast<char>(EEPROM.read(TOSS_SECRET_AT + i));
+  tossId[TOSS_ID_LEN - 1] = tossSecret[TOSS_SECRET_LEN - 1] = 0;
+  if (static_cast<uint8_t>(tossId[0]) == 0xFF) tossId[0] = 0;  // 한 번도 안 쓴 칸
+  if (static_cast<uint8_t>(tossSecret[0]) == 0xFF) tossSecret[0] = 0;
 }
 
 void saveSettings() {
   EEPROM.write(0, EEPROM_MAGIC);
   EEPROM.write(1, theme);
   EEPROM.write(2, mode);
+  for (int i = 0; i < TOSS_ID_LEN; i++) EEPROM.write(TOSS_ID_AT + i, tossId[i]);
+  for (int i = 0; i < TOSS_SECRET_LEN; i++) EEPROM.write(TOSS_SECRET_AT + i, tossSecret[i]);
   EEPROM.commit();
 }
 
@@ -255,12 +267,12 @@ struct StockDef {
   const char* sub;
 };
 const StockDef STOCKS[2] = {
-    {"SOXL", false, "SOXL", "반도체 3배 레버리지 · 미국"},
-    {"000660", true, "SK하이닉스", "000660 · 코스피"},  // 국내는 네이버 증권 (넥스트레이드 프리 · 애프터 포함)
+    {"SOXL", false, "SOXL", ""},
+    {"000660", true, "SK하이닉스", ""},  // 국내는 네이버 증권 (넥스트레이드 프리 · 애프터 포함)
 };
 // 1분봉 캔들 - 최근 40개 (100분치를 받아 빈 분을 건너뛰고 끝에서 40개)
-constexpr int CANDLES = 40;
-constexpr int C_PITCH = 5;  // 캔들 한 칸 5px (몸통 3px + 틈 2px)
+constexpr int CANDLES = 30;  // 작은 화면에서 또렷하게 - 최근 30분
+constexpr int C_PITCH = 7;  // 캔들 한 칸 7px (몸통 5px + 틈 2px)
 struct Candle {
   float o, h, l, c;
 };
@@ -270,6 +282,7 @@ struct Quote {
   Candle candles[CANDLES];
   uint8_t n = 0;
   time_t at = 0;              // 가격 기준 시각
+  time_t lastMin = 0;         // 마지막 1분봉의 시작 시각 (실시간 체결이 이 분이면 갱신, 다음 분이면 새 캔들)
   char session[40] = "";      // 아래 줄에 붙는 " · 프리마켓" · " · 애프터마켓" · " · 장 마감"
   bool live = false;          // 지금 거래 중 (정규장 · 프리 · 애프터) - 1분마다 받는다
   // 미국 (Yahoo) - 하루 시세
@@ -278,7 +291,7 @@ struct Quote {
   unsigned long fetchedAt = 0, metaAt = 0;
 } quotes[2];
 
-constexpr int CH_X0 = 16, CH_X1 = 224, CH_Y0 = 156, CH_Y1 = 210;
+constexpr int CH_X0 = 10, CH_X1 = 230, CH_Y0 = 70, CH_Y1 = 214;
 int16_t cHi[CANDLES], cLo[CANDLES], cTop[CANDLES], cBot[CANDLES];
 bool cUp[CANDLES];
 int cLeft = CH_X0, cCount = 0, prevLineY = -1;
@@ -318,11 +331,10 @@ void drawChart() {
   for (int k = 0; k < cCount; k++) {
     const int cx = cLeft + k * C_PITCH;
     const uint16_t c = cUp[k] ? UP_C : DOWN_C;  // 캔들마다 오르면 빨강 · 내리면 파랑
-    for (int y = max(r0, static_cast<int>(cHi[k])); y <= min(r1 - 1, static_cast<int>(cLo[k])); y++) plot(cx + 1, y, c, 255);
+    const int body = C_PITCH - 2;
+    for (int y = max(r0, static_cast<int>(cHi[k])); y <= min(r1 - 1, static_cast<int>(cLo[k])); y++) plot(cx + body / 2, y, c, 255);
     for (int y = max(r0, static_cast<int>(cTop[k])); y <= min(r1 - 1, static_cast<int>(cBot[k])); y++) {
-      plot(cx, y, c, 255);
-      plot(cx + 1, y, c, 255);
-      plot(cx + 2, y, c, 255);
+      for (int dx = 0; dx < body; dx++) plot(cx + dx, y, c, 255);
     }
   }
 }
@@ -381,24 +393,20 @@ void withCommas(char* out, size_t n, long v) {
   out[o] = 0;
 }
 
+// 주가 화면 - 1행 가격 · 2행 이름 + 등락 · 나머지는 1분봉 차트 · 맨 아래 기준 시각
 void paintStock(const StockDef& d, const Quote& q) {
-  if (d.kr) {
-    drawText(F_KOTITLE, d.title, 16, topBase(F_KOTITLE, 16), col.fg);
-  } else {
-    drawText(F_TITLE, d.title, 16, topBase(F_TITLE, 14), col.fg);
-  }
-  drawText(F_SUB, d.sub, 16, topBase(F_SUB, 48), col.sub);
-
+  const Font& nameFont = d.kr ? F_NAME_KO : F_NAME_EN;
   if (!q.ok) {
-    drawSprite(AXO_MINI, 0, 168, 8);
-    drawText(F_FOOT, q.failed ? "못 받았어요 · 다시 시도해요" : "불러오는 중", 16, topBase(F_FOOT, 222), col.sub);
+    drawSprite(AXO_MINI, 0, 184, 6);
+    drawText(nameFont, d.title, 12, topBase(nameFont, 46), col.sub);
+    drawText(F_FOOT, q.failed ? "못 받았어요 · 다시 시도해요" : "불러오는 중", 12, topBase(F_FOOT, 224), col.sub);
     return;
   }
   const float diff = q.price - q.prev;
   const bool up = diff >= 0;
-  drawSprite(AXO_MINI, up ? 0 : 1, 168, 8);  // 오르면 웃고 내리면 시무룩
+  drawSprite(AXO_MINI, up ? 0 : 1, 184, 6);  // 오르면 웃고 내리면 시무룩
 
-  char price[24], amount[24], line[48];
+  char price[24], amount[24], line[64];
   if (d.kr) {
     withCommas(price, sizeof(price), lroundf(q.price));
     withCommas(amount, sizeof(amount), lroundf(fabsf(diff)));
@@ -406,16 +414,20 @@ void paintStock(const StockDef& d, const Quote& q) {
     snprintf(price, sizeof(price), "$%.2f", q.price);
     snprintf(amount, sizeof(amount), "%.2f", fabsf(diff));
   }
-  drawText(F_PRICE, price, 14, topBase(F_PRICE, 66), col.fg);
-  if (d.kr) drawText(F_WON, "원", 16 + textWidth(F_PRICE, price), 101, col.fg);
-  snprintf(line, sizeof(line), "%s %s   %+.2f%%", up ? "▲" : "▼", amount, q.prev ? diff / q.prev * 100 : 0.0f);
-  drawText(F_CHG, line, 16, topBase(F_CHG, 128), up ? UP_C : DOWN_C);
-  if (chartReady) drawText(F_FOOT, "1분봉", CH_X1, 146, col.sub, RIGHT);
+  const int pb = topBase(F_PRICE, 8);
+  drawText(F_PRICE, price, 12, pb, col.fg);
+  if (d.kr) drawText(F_WON, "원", 12 + textWidth(F_PRICE, price) + 2, pb, col.fg);
+
+  drawText(nameFont, d.title, 12, topBase(nameFont, 46), col.sub);
+  const int nx = 12 + textWidth(nameFont, d.title) + 10;
+  snprintf(line, sizeof(line), "%s %s  %+.2f%%", up ? "▲" : "▼", amount, q.prev ? diff / q.prev * 100 : 0.0f);
+  drawText(F_CHG, line, nx, topBase(F_CHG, 47), up ? UP_C : DOWN_C);
+
   drawChart();
 
   const struct tm* t = localtime(&q.at);
-  snprintf(line, sizeof(line), "%d월 %d일 %02d:%02d 기준%s", t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, q.session);
-  drawText(F_FOOT, line, 16, topBase(F_FOOT, 222), col.sub);
+  snprintf(line, sizeof(line), "1분봉 · %d월 %d일 %02d:%02d:%02d 기준%s", t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, q.session);
+  drawText(F_FOOT, line, 12, topBase(F_FOOT, 224), col.sub);
 }
 
 void paintTheme() {
@@ -445,29 +457,30 @@ void renderAll() {
 String lastNetErr = "";  // 설정 페이지에 보이는 마지막 받기 문제
 bool safeMode = false;   // 연속으로 멈춰 다시 켜졌으면 받기를 멈춘다
 
-bool httpsJson(const char* host, const String& path, JsonDocument& doc, JsonDocument& filter) {
+bool httpsJson(const char* host, const String& path, JsonDocument& doc, JsonDocument& filter, const String* postBody = nullptr) {
   if (safeMode || WiFi.status() != WL_CONNECTED) return false;
   BearSSL::WiFiClientSecure client;
   client.setInsecure();  // 인증서 확인 생략 - 공개 시세 · 날씨만 받는다
-  const bool mfln = client.probeMaxFragmentLength(host, 443, 1024);
-  // 메모리가 모자라면 받지 않고 넘어간다 (모자란 채로 연결하면 칩이 멈추고 다시 켜진다)
-  // 16KB 받기 버퍼 + BearSSL 전용 스택 약 6KB + 여유
-  const uint32_t need = mfln ? 12000 : 26000;
-  if (ESP.getMaxFreeBlockSize() < need) {
-    lastNetErr = String(host) + " 메모리 부족 (" + ESP.getMaxFreeBlockSize() + "B)";
+  // 메모리가 모자라면 받지 않고 넘어간다. client 를 만들 때 BearSSL 전용 스택(약 6KB)은 이미 잡혔고,
+  // 남은 것은 받기 버퍼 8KB + 엔진 약 4KB (응답은 모두 8KB 아래로 받는다 - 1분봉은 60분치만.
+  // 쓰는 서버들은 작은 조각 전송(MFLN)을 지원하지 않는다)
+  if (ESP.getFreeHeap() < 14000 || ESP.getMaxFreeBlockSize() < 9000) {
+    lastNetErr = String(host) + " 메모리 부족 (" + ESP.getFreeHeap() + "B)";
     return false;
   }
-  if (mfln) {
-    client.setBufferSizes(1024, 1024);
-  } else {
-    client.setBufferSizes(16384, 512);
-  }
+  client.setBufferSizes(8192, 512);
   HTTPClient http;
   http.useHTTP10(true);  // 조각 전송(chunked) 없이 받아 바로 읽는다
   http.setTimeout(10000);
   http.setUserAgent("Mozilla/5.0");
   if (!http.begin(client, host, 443, path, true)) return false;
-  const int code = http.GET();
+  int code;
+  if (postBody) {
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    code = http.POST(*postBody);
+  } else {
+    code = http.GET();
+  }
   bool ok = false;
   if (code == 200) ok = !deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   if (!ok) lastNetErr = String(host) + " 응답 " + code;
@@ -577,7 +590,7 @@ bool fetchUs(Quote& q, const char* symbol) {
   f["open"] = f["high"] = f["low"] = f["close"] = true;
   JsonDocument doc;
   const String path = String("/v8/finance/chart/") + symbol + "?interval=1m&includePrePost=true&period1=" +
-                      String(static_cast<long>(end - 6000)) + "&period2=" + String(static_cast<long>(end));
+                      String(static_cast<long>(end - 3600)) + "&period2=" + String(static_cast<long>(end));
   time_t lastAt = 0;
   float lastClose = 0;
   if (httpsJson("query1.finance.yahoo.com", path, doc, filter)) {
@@ -592,6 +605,7 @@ bool fetchUs(Quote& q, const char* symbol) {
       lastClose = out.c;
       return true;
     });
+    if (lastAt) q.lastMin = lastAt - lastAt % 60;
     if (!res["meta"]["regularMarketPrice"].isNull()) {
       q.regPrice = res["meta"]["regularMarketPrice"];
       q.regTime = res["meta"]["regularMarketTime"].as<long>();
@@ -667,11 +681,11 @@ bool fetchKr(Quote& q, const char* code) {
   // 1분봉 - 마지막 거래 시각까지 100분치 (네이버 시간 형식 yyyyMMddHHmm)
   if (q.at > 0) {
     char from[16], to[16];
-    const time_t end = q.at + 60, start = end - 6000;
+    const time_t end = q.at + 60, start = end - 3600;
     strftime(from, sizeof(from), "%Y%m%d%H%M", localtime(&start));
     strftime(to, sizeof(to), "%Y%m%d%H%M", localtime(&end));
     JsonDocument cf;
-    cf[0]["openPrice"] = cf[0]["highPrice"] = cf[0]["lowPrice"] = cf[0]["currentPrice"] = true;
+    cf[0]["openPrice"] = cf[0]["highPrice"] = cf[0]["lowPrice"] = cf[0]["currentPrice"] = cf[0]["localDateTime"] = true;
     JsonDocument cd;
     if (httpsJson("api.stock.naver.com", String("/chart/domestic/item/") + code + "/minute?startDateTime=" + from + "&endDateTime=" + to,
                   cd, cf)) {
@@ -680,6 +694,16 @@ bool fetchKr(Quote& q, const char* code) {
         JsonObject it = arr[k];
         if (it["currentPrice"].isNull() || it["openPrice"].isNull()) return false;
         out = {it["openPrice"].as<float>(), it["highPrice"].as<float>(), it["lowPrice"].as<float>(), it["currentPrice"].as<float>()};
+        int Y2, M2, D2, h2, m2;
+        if (sscanf(it["localDateTime"] | "", "%4d%2d%2d%2d%2d", &Y2, &M2, &D2, &h2, &m2) == 5) {
+          struct tm lt = {};
+          lt.tm_year = Y2 - 1900;
+          lt.tm_mon = M2 - 1;
+          lt.tm_mday = D2;
+          lt.tm_hour = h2;
+          lt.tm_min = m2;
+          q.lastMin = mktime(&lt);
+        }
         return true;
       });
     }
@@ -703,6 +727,220 @@ bool fetchQuote(int i) {
 
 // 다음에 받을 때까지 - 거래 중(프리 · 정규 · 애프터) 1분, 아니면 10분
 unsigned long quoteInterval(const Quote& q) { return q.live ? 60000 : 600000; }
+
+// ── 토스증권 실시간 체결 (웹소켓) ──────────────────────
+// 토큰(24시간)을 받아 wss://openapi-ws.tossinvest.com/ws/v1 에 붙고, 지금 테마 종목의 체결을 구독한다.
+// 서버가 작은 조각 전송(MFLN)을 안 해서 받기 버퍼를 8KB 로 둔다 (인증서 묶음 3.7KB · 체결 프레임 200바이트 안팎)
+constexpr const char* TOSS_WS_HOST = "openapi-ws.tossinvest.com";
+String tossToken = "";
+uint16_t wsRx = 6144;  // 소켓 받기 칸 - 인증서 묶음 3.7KB 라 6KB 로 충분, 안 붙으면 8KB 로 올린다
+unsigned long tossTokenExp = 0, wsRetryAt = 0, wsPingAt = 0, wsOpenedAt = 0, lastTradeDraw = 0;
+BearSSL::WiFiClientSecure* ws = nullptr;
+constexpr size_t WSBUF = 1536;
+uint8_t* wsBuf = nullptr;  // 소켓이 붙어 있을 때만 잡는다
+int wsSym = -1;          // 구독 중인 종목 (STOCKS 번호)
+uint32_t wsTrades = 0;   // 이번 연결에서 받은 체결 수
+String tossStatus = "키 없음";
+bool tradeDirty = false;
+
+bool tossReady() { return tossId[0] && tossSecret[0]; }
+
+bool fetchTossToken() {
+  JsonDocument filter;
+  filter["access_token"] = true;
+  filter["expires_in"] = true;
+  JsonDocument doc;
+  const String body = String("grant_type=client_credentials&client_id=") + tossId + "&client_secret=" + tossSecret;
+  if (!httpsJson("openapi.tossinvest.com", "/oauth2/token", doc, filter, &body) || doc["access_token"].isNull()) {
+    tossStatus = "토큰을 못 받았어요 (키 · 허용 IP 확인)";
+    return false;
+  }
+  tossToken = doc["access_token"].as<String>();
+  const long life = doc["expires_in"] | 86400L;
+  tossTokenExp = millis() + static_cast<unsigned long>(max(60L, life - 600)) * 1000UL;  // 만료 10분 전에 새로
+  return true;
+}
+
+void wsClose() {
+  if (!ws) return;
+  ws->stop();
+  delete ws;
+  ws = nullptr;
+  wsSym = -1;
+  free(wsBuf);
+  wsBuf = nullptr;
+}
+
+// 클라이언트 → 서버 프레임은 가린다(mask)
+void wsSend(const char* data, size_t len, uint8_t op = 0x1) {
+  if (!ws) return;
+  uint8_t hdr[8];
+  size_t h = 0;
+  hdr[h++] = 0x80 | op;
+  if (len < 126) {
+    hdr[h++] = 0x80 | len;
+  } else {
+    hdr[h++] = 0x80 | 126;
+    hdr[h++] = (len >> 8) & 0xFF;
+    hdr[h++] = len & 0xFF;
+  }
+  uint8_t mask[4];
+  for (uint8_t& m : mask) m = static_cast<uint8_t>(random(256));
+  memcpy(hdr + h, mask, 4);
+  h += 4;
+  ws->write(hdr, h);
+  uint8_t chunk[64];
+  for (size_t i = 0; i < len; i += sizeof(chunk)) {
+    const size_t n = min(sizeof(chunk), len - i);
+    for (size_t k = 0; k < n; k++) chunk[k] = static_cast<uint8_t>(data[i + k]) ^ mask[(i + k) % 4];
+    ws->write(chunk, n);
+  }
+}
+
+void wsSubscribe(int i) {
+  char decl[96];
+  snprintf(decl, sizeof(decl), "[{\"type\":\"%s\",\"codes\":[\"%s\"]}]", STOCKS[i].kr ? "trade:kr" : "trade:us", STOCKS[i].symbol);
+  wsSend(decl, strlen(decl));
+  wsSym = i;
+}
+
+bool wsOpen(int i) {
+  if (ESP.getFreeHeap() < 20000) {
+    tossStatus = "메모리 부족 (" + String(ESP.getFreeHeap()) + "B)";
+    return false;
+  }
+  ws = new BearSSL::WiFiClientSecure();
+  ws->setInsecure();
+  ws->setBufferSizes(wsRx, 512);
+  ws->setTimeout(8000);
+  if (!ws->connect(TOSS_WS_HOST, 443)) {
+    tossStatus = "연결하지 못했어요";
+    wsRx = 8192;
+    wsClose();
+    return false;
+  }
+  uint8_t rnd[16];
+  for (uint8_t& b : rnd) b = static_cast<uint8_t>(random(256));
+  ws->print(String("GET /ws/v1 HTTP/1.1\r\nHost: ") + TOSS_WS_HOST +
+            "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " +
+            base64::encode(rnd, sizeof(rnd)) + "\r\nAuthorization: Bearer " + tossToken + "\r\n\r\n");
+  const String status = ws->readStringUntil('\n');
+  if (status.indexOf(" 101") < 0) {
+    if (status.indexOf(" 401") >= 0) {
+      tossToken = "";  // 토큰이 무효 - 다음에 새로 받는다
+      tossStatus = "토큰이 무효예요 (다시 받는 중)";
+    } else if (status.indexOf(" 403") >= 0) {
+      tossStatus = "허용 IP 가 아니에요 (토스 설정 > Open API > 허용 IP)";
+    } else {
+      tossStatus = "연결 거절: " + status.substring(0, 24);
+    }
+    wsClose();
+    return false;
+  }
+  while (ws->connected()) {  // 나머지 응답 머리 줄은 빈 줄까지 버린다
+    const String line = ws->readStringUntil('\n');
+    if (line.length() <= 1) break;
+  }
+  wsBuf = static_cast<uint8_t*>(malloc(WSBUF));
+  if (!wsBuf) {
+    tossStatus = "메모리 부족";
+    wsClose();
+    return false;
+  }
+  wsTrades = 0;
+  wsOpenedAt = wsPingAt = millis();
+  wsSubscribe(i);
+  tossStatus = "연결됨";
+  return true;
+}
+
+// 체결 하나 - 가격과 마지막 1분봉을 갱신한다 (다음 분이면 새 캔들)
+void onTrade(int i, float price, time_t t) {
+  Quote& q = quotes[i];
+  q.price = price;
+  q.at = t;
+  const time_t m = t - t % 60;
+  if (q.n == 0 || m > q.lastMin) {
+    if (q.n == CANDLES) {
+      memmove(q.candles, q.candles + 1, sizeof(Candle) * (CANDLES - 1));
+      q.n--;
+    }
+    q.candles[q.n++] = {price, price, price, price};
+    q.lastMin = m;
+  } else if (m == q.lastMin) {
+    Candle& c = q.candles[q.n - 1];
+    c.h = max(c.h, price);
+    c.l = min(c.l, price);
+    c.c = price;
+  }
+  wsTrades++;
+  tradeDirty = true;
+}
+
+time_t parseIsoKst(const char* s) {  // "2026-11-09T22:28:43.064+09:00" (토스는 한국 시각으로 준다)
+  int Y, M, D, h, m, sec;
+  if (sscanf(s, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) != 6) return time(nullptr);
+  struct tm tt = {};
+  tt.tm_year = Y - 1900;
+  tt.tm_mon = M - 1;
+  tt.tm_mday = D;
+  tt.tm_hour = h;
+  tt.tm_min = m;
+  tt.tm_sec = sec;
+  return mktime(&tt);
+}
+
+
+void wsHandleText(size_t n) {
+  if (n == 0 || wsBuf[0] != '{') return;
+  JsonDocument doc;
+  if (deserializeJson(doc, reinterpret_cast<const char*>(wsBuf), n)) return;
+  const char* type = doc["type"] | "";
+  if (strcmp(type, "message") == 0 && wsSym >= 0) {
+    const char* p = doc["data"]["price"] | "";
+    if (*p) onTrade(wsSym, atof(p), parseIsoKst(doc["data"]["timestamp"] | ""));
+  } else if (strcmp(type, "error") == 0) {
+    const char* code = doc["error"]["code"] | "";
+    if (strcmp(code, "auth-revoked") == 0) tossToken = "";
+    tossStatus = String("오류: ") + code;
+    wsClose();
+    wsRetryAt = millis() + 15000;
+  }
+}
+
+// 받은 프레임을 처리한다 (한 번에 최대 20개 - 화면 그리기가 밀리지 않게)
+void wsPoll() {
+  for (int k = 0; k < 20 && ws && ws->available() >= 2; k++) {
+    const uint8_t h0 = ws->read(), h1 = ws->read();
+    const uint8_t op = h0 & 0x0F;
+    size_t n = h1 & 0x7F;
+    if (n == 126) {
+      n = (ws->read() << 8) | ws->read();
+    } else if (n == 127) {
+      n = 0;
+      for (int b = 0; b < 8; b++) n = (n << 8) | ws->read();
+    }
+    if (n > WSBUF) {  // 너무 큰 프레임은 버린다
+      for (size_t r = 0; r < n && ws->connected(); r++) ws->read();
+      continue;
+    }
+    if (ws->readBytes(wsBuf, n) != n) break;
+    if (op == 0x1) {
+      wsHandleText(n);
+    } else if (op == 0x9) {
+      wsSend(reinterpret_cast<const char*>(wsBuf), n, 0xA);  // ping → pong
+    } else if (op == 0x8) {
+      tossStatus = "서버가 연결을 닫았어요";
+      wsClose();
+      wsRetryAt = millis() + 5000;
+    }
+  }
+  if (ws && !ws->connected()) {
+    tossStatus = "연결이 끊겼어요";
+    wsClose();
+    wsRetryAt = millis() + 5000;
+  }
+}
 
 // ── 연속 멈춤 감지 ────────────────────────────────────
 struct RtcState {
@@ -729,7 +967,7 @@ void clearCrashCount() {
 
 // ── 와이파이 · 웹 ─────────────────────────────────────
 ESP8266WebServer server(80);
-ESP8266HTTPUpdateServer updater;
+bool updating = false;  // 펌웨어를 받는 중 - 소켓 · 받아오기 · 그리기를 멈춘다
 bool setupMode = false;
 unsigned long restartAt = 0;
 wl_status_t failStatus = WL_IDLE_STATUS;
@@ -923,6 +1161,7 @@ void handleRoot() {
     d += rowHtml("날씨", agoText(weather.ok, false, weather.at));
     d += rowHtml("SOXL", agoText(quotes[0].ok, quotes[0].failed, quotes[0].fetchedAt));
     d += rowHtml("SK하이닉스", agoText(quotes[1].ok, quotes[1].failed, quotes[1].fetchedAt));
+    d += rowHtml("토스 실시간", !tossReady() ? String("키 없음") : ws ? "연결됨 · 체결 " + String(wsTrades) + "건" : tossStatus);
   }
   d += rowHtml("주소", ipText()) + rowHtml("켜진 지", uptimeText()) +
        rowHtml("남은 메모리", String(ESP.getFreeHeap() / 1024) + " KB (한 덩어리 " + String(ESP.getMaxFreeBlockSize() / 1024) + " KB)") +
@@ -932,6 +1171,12 @@ void handleRoot() {
   if (safeMode || ESP.getResetInfoPtr()->reason == REASON_EXCEPTION_RST) d += "<p class=desc>" + ESP.getResetInfo() + "</p>";
   d += "<div class=end><button class='b sub' onclick='wf.hidden=!wf.hidden'>와이파이 바꾸기</button>"
        "<a class='btn sub' href=/update>펌웨어 올리기</a></div>";
+  if (!setupMode) {
+    d += String("<form method=post action=/toss><label class=check>토스증권 Open API 키 (") + (tossReady() ? "등록됨" : "없음") +
+         ") - 기기에만 저장돼요</label><input name=id placeholder='client_id' autocomplete=off>"
+         "<input name=secret type=password placeholder='client_secret' autocomplete=off>"
+         "<div class=end><button class='b sub'>키 저장</button></div></form>";
+  }
   d += String("<form id=wf method=post action=/wifi") + (setupMode ? "" : " hidden") + ">";
   if (scannedCount > 0) {
     d += "<select name=pick>";
@@ -983,6 +1228,8 @@ void handleTheme() {
   }
   theme = static_cast<Theme>(i);
   saveSettings();
+  wsClose();
+  wsRetryAt = 0;
   if (theme != TH_PET) {
     const Quote& q = quotes[theme - 1];
     buildChart(q);
@@ -1004,6 +1251,56 @@ void handleMode() {
   saveSettings();
   server.send(200, "text/plain", "ok");
   renderAll();
+}
+
+void handleToss() {
+  const String id = server.arg("id"), secret = server.arg("secret");
+  if (id.length() == 0 || secret.length() == 0 || id.length() >= TOSS_ID_LEN || secret.length() >= TOSS_SECRET_LEN) {
+    server.send(400, "text/plain; charset=utf-8", "client_id 와 client_secret 을 둘 다 넣어 주세요");
+    return;
+  }
+  strncpy(tossId, id.c_str(), TOSS_ID_LEN - 1);
+  strncpy(tossSecret, secret.c_str(), TOSS_SECRET_LEN - 1);
+  saveSettings();
+  tossToken = "";
+  wsClose();
+  wsRetryAt = 0;
+  tossStatus = "키 저장함 - 곧 연결해요";
+  sendNotice("토스 키를 저장했어요", "주가 테마에서 실시간 체결을 받기 시작해요.", 3);
+}
+
+void handleUpdatePage() {
+  sendNotice("펌웨어 올리기", "<form method=post enctype=multipart/form-data><input type=file name=firmware accept=.bin>"
+                            "<div class=end><button class='b main'>올리기</button></div></form>",
+             600);
+}
+
+void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    updating = true;
+    wsClose();  // 소켓이 쓰던 메모리(약 15KB)를 먼저 돌려받는다
+    const uint32_t maxSketch = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    Update.begin(maxSketch, U_FLASH);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (Update.isRunning()) Update.write(up.buf, up.currentSize);
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (Update.isRunning()) Update.end(true);
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.end();
+    updating = false;
+  }
+  yield();
+}
+
+void handleUpdateDone() {
+  if (Update.hasError() || !Update.isFinished()) {
+    server.send(200, "text/plain; charset=utf-8", "Update error: " + Update.getErrorString());
+    updating = false;
+    return;
+  }
+  server.send(200, "text/html", "<META http-equiv=\"refresh\" content=\"15;URL=/\">Update Success! Rebooting...");
+  restartAt = millis() + 1000;
 }
 
 void handlePoke() {
@@ -1062,6 +1359,45 @@ void tickMinute() {
   }
 }
 
+// 주가 테마 + 토스 키가 있으면 소켓을 붙여 둔다
+void tossLoop() {
+  const bool want = theme != TH_PET && tossReady() && !safeMode && quotes[theme - 1].ok;
+  if (!want) {
+    wsClose();
+    return;
+  }
+  const int i = theme - 1;
+  if (!ws) {
+    if (millis() < wsRetryAt) return;
+    if (tossToken.length() == 0 || millis() > tossTokenExp) {
+      if (!fetchTossToken()) {
+        wsRetryAt = millis() + 60000;
+        return;
+      }
+    }
+    if (!wsOpen(i)) {
+      wsRetryAt = millis() + 30000;
+      return;
+    }
+  }
+  if (wsSym != i) wsSubscribe(i);
+  wsPoll();
+  if (ws && millis() - wsPingAt > 50000) {
+    wsSend("PING", 4);
+    wsPingAt = millis();
+  }
+  if (ws && millis() - wsOpenedAt > 30UL * 60000) {  // 30분마다 시세를 HTTPS 로 새로 받는다
+    wsClose();
+    nextQuote = 0;
+  }
+  if (tradeDirty && millis() - lastTradeDraw > 250) {  // 체결은 초당 4번까지만 다시 그린다
+    tradeDirty = false;
+    lastTradeDraw = millis();
+    buildChart(quotes[i]);
+    renderRows(0, 240);
+  }
+}
+
 void fetchDue() {
   const unsigned long now = millis();
   if (theme == TH_PET) {
@@ -1070,6 +1406,7 @@ void fetchDue() {
     nextWeather = now + (ok ? 15UL * 60000 : 60000);
     if (ok) renderAll();
   } else {
+    if (ws) return;  // 실시간 체결을 받는 중
     if (now < nextQuote) return;
     const int i = theme - 1;
     const bool ok = fetchQuote(i);
@@ -1090,13 +1427,15 @@ void setup() {
 
   if (!connectSavedWifi()) startSetupAp();
 
-  updater.setup(&server, "/update");
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/", HTTP_GET, handleRoot);
   server.on("/wifi", HTTP_POST, handleWifi);
   server.on("/theme", handleTheme);
   server.on("/mode", handleMode);
   server.on("/poke", handlePoke);
   server.on("/thumb", handleThumb);
+  server.on("/toss", HTTP_POST, handleToss);
   server.onNotFound([] { server.sendHeader("Location", "/"); server.send(302); });
   server.begin();
 
@@ -1129,7 +1468,7 @@ void setup() {
 void loop() {
   server.handleClient();
   if (restartAt != 0 && millis() > restartAt) ESP.restart();
-  if (setupMode) return;
+  if (setupMode || updating) return;
   MDNS.update();
   if (safeMode) return;
   static bool cleared = false;
@@ -1139,5 +1478,6 @@ void loop() {
   }
   tickMinute();
   fetchDue();
+  tossLoop();
   if (theme == TH_PET) animatePet();
 }

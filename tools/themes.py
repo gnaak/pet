@@ -301,6 +301,60 @@ def screen_stock(mode, q, title, subtitle, price_text, unit, footer):
 
 CANDLES = 40
 
+# ── 주가 화면 v2 - 가격을 위에 작게, 나머지는 차트 ─────────────
+CHART2 = dict(x0=10, x1=230, y0=70, y1=214, n=30)
+
+
+def screen_stock2(mode, q, name, price_text, unit, footer):
+    m = MODES[mode]
+    im = Image.new("RGBA", (240, 240), m["bg"] + (255,))
+    d = ImageDraw.Draw(im)
+    price, prev = q["price"], q["prev"]
+    diff = price - prev
+    up = diff >= 0
+    col = UP if up else DOWN
+
+    # 1행: 가격 (예전 SOXL 이름 크기) · 오른쪽 위 작은 우파루파
+    pf = NUM(32)
+    text(d, (12, 8), price_text, pf, m["fg"])
+    if unit:
+        base = 8 + pf.getmetrics()[0]
+        text(d, (12 + d.textlength(price_text, font=pf) + 2, base), unit, KO_S(15), m["fg"], "ls")
+    pet = axolotl("happy" if up else "sad").resize((46, 40), Image.LANCZOS)
+    im.alpha_composite(pet, (184, 6))
+
+    # 2행: 이름 + 등락
+    nf = NUM(18) if name.isascii() else KO_S(14)
+    text(d, (12, 46), name, nf, m["sub"])
+    nx = 12 + d.textlength(name, font=nf) + 10
+    pct = diff / prev * 100
+    amount = f"{abs(diff):,.0f}" if unit else f"{abs(diff):.2f}"
+    text(d, (nx, 47), f"{'▲' if up else '▼'} {amount}  {pct:+.2f}%", KO_S(14), col)
+
+    # 차트 - 1분봉 44개, 캔들마다 오르면 빨강 · 내리면 파랑
+    c = CHART2
+    cs = q["candles"][-c["n"]:]
+    lo, hi = min(x[2] for x in cs), max(x[1] for x in cs)
+    span = (hi - lo) or 1
+    Y = lambda v: c["y1"] - (v - lo) / span * (c["y1"] - c["y0"])  # noqa: E731
+    if lo <= prev <= hi:
+        py = round(Y(prev))
+        for x in range(c["x0"], c["x1"], 6):
+            d.line([(x, py), (x + 2, py)], fill=m["grid"], width=1)
+    pitch = max(3, (c["x1"] - c["x0"]) // c["n"])  # 캔들 수에 맞춰 칸 폭 (몸통은 칸 - 2px, 심지는 가운데)
+    body = max(1, pitch - 2)
+    left = c["x0"] + (c["x1"] - c["x0"] - c["n"] * pitch) // 2 + (c["n"] - len(cs)) * pitch
+    for k, (o, h, l, cl) in enumerate(cs):
+        cx = left + k * pitch
+        colr = UP if cl >= o else DOWN
+        mid = cx + body // 2
+        d.line([(mid, round(Y(h))), (mid, round(Y(l)))], fill=colr, width=1)
+        top, bot = round(Y(max(o, cl))), round(Y(min(o, cl)))
+        d.rectangle([cx, top, cx + body - 1, max(bot, top)], fill=colr)
+
+    text(d, (12, 224), "1분봉 · " + footer, KO_M(11), m["sub"])
+    return im
+
 
 def load_quote(folder, symbol, fallback):
     """m_<종목>.json (하루 시세: 전날 종가) + c_<종목>.json (1분봉) 이 있으면 그것으로"""
@@ -325,17 +379,17 @@ def main():
     for mode in ("dark", "light"):
         cols.append([
             screen_pet(mode, now, weather),
-            screen_stock(mode, soxl, "SOXL", "반도체 3배 레버리지 · 미국", f"${soxl['price']:.2f}", "",
-                         f"{soxl['time'].month}월 {soxl['time'].day}일 {soxl['time']:%H:%M} 기준 · 장 마감"),
-            screen_stock(mode, hynix, "SK하이닉스", "000660 · 코스피", f"{hynix['price']:,.0f}", "원",
-                         f"{hynix['time'].month}월 {hynix['time'].day}일 {hynix['time']:%H:%M} 기준"),
+            screen_stock2(mode, soxl, "SOXL", f"${soxl['price']:.2f}", "",
+                          f"{soxl['time'].month}월 {soxl['time'].day}일 {soxl['time']:%H:%M} 기준 · 장 마감"),
+            screen_stock2(mode, hynix, "SK하이닉스", f"{hynix['price']:,.0f}", "원",
+                          f"{hynix['time'].month}월 {hynix['time'].day}일 {hynix['time']:%H:%M} 기준"),
         ])
     gap, scale = 16, 2
     sheet = Image.new("RGB", (3 * 240 + 4 * gap, 2 * 240 + 3 * gap), (90, 90, 96))
     for r, row in enumerate(cols):
         for c, im in enumerate(row):
             sheet.paste(im.convert("RGB"), (gap + c * (240 + gap), gap + r * (240 + gap)))
-    sheet.resize((sheet.width * scale, sheet.height * scale), Image.LANCZOS).save(ROOT / "tools" / "themes_v2.png")
+    sheet.resize((sheet.width * scale, sheet.height * scale), Image.LANCZOS).save(ROOT / "tools" / "themes_v3.png")
     print("tools/themes.png (위 다크 · 아래 라이트 / 왼쪽부터 펫 · SOXL · SK하이닉스)")
 
 

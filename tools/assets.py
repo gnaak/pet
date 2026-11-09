@@ -163,7 +163,7 @@ def png_bytes(img):
 def main():
     # 우파루파 - 큰 것 (펫 테마) · 작은 것 (주가 테마 오른쪽 위)
     emit_sprites("AXO", [themes.axolotl("idle"), themes.axolotl("idle", 5), themes.axolotl("blink"), themes.axolotl("happy")])
-    emit_sprites("AXO_MINI", [themes.axolotl(f).resize((60, 52), Image.LANCZOS) for f in ("happy", "sad")])
+    emit_sprites("AXO_MINI", [themes.axolotl(f).resize((46, 40), Image.LANCZOS) for f in ("happy", "sad")])
     emit_sprites("WICON", [weather_icon(k) for k in WEATHER_KINDS])
     out.append("enum WeatherKind : uint8_t { " + ", ".join(f"W_{k.upper()}" for k in WEATHER_KINDS) + " };")
     out.append("")
@@ -172,26 +172,33 @@ def main():
     date_chars = "0123456789월일화수목금토요 "
     foot_chars = "0123456789월일:기준장마감· 불러오는중못받았어요다시시도해요분봉프리애터켓"
     emit_font("F_CLOCK", "Rajdhani-Bold.ttf", 64, "0123456789:-")
-    emit_font("F_PRICE", "Rajdhani-Bold.ttf", 54, "0123456789.,$")
-    emit_font("F_TITLE", "Rajdhani-Bold.ttf", 30, "SOXL")
+    emit_font("F_PRICE", "Rajdhani-Bold.ttf", 32, "0123456789.,$")
+    emit_font("F_NAME_EN", "Rajdhani-Bold.ttf", 18, "SOXL")
     emit_font("F_TEMP", "Rajdhani-Bold.ttf", 24, "0123456789°-")
     emit_font("F_TEMP2", "Rajdhani-SemiBold.ttf", 17, "0123456789°/ -")
     emit_font("F_DATE", "Pretendard-SemiBold.otf", 15, date_chars)
-    emit_font("F_CHG", "Pretendard-SemiBold.otf", 16, "▲▼0123456789.,+-% ")
-    emit_font("F_KOTITLE", "Pretendard-Bold.otf", 22, "SK하이닉스")
-    emit_font("F_WON", "Pretendard-SemiBold.otf", 18, "원")
-    emit_font("F_SUB", "Pretendard-Medium.otf", 12, "반도체 3배레버리지·미국000660코스피 ")
+    emit_font("F_CHG", "Pretendard-SemiBold.otf", 14, "▲▼0123456789.,+-% ")
+    emit_font("F_NAME_KO", "Pretendard-SemiBold.otf", 14, "SK하이닉스")
+    emit_font("F_WON", "Pretendard-SemiBold.otf", 15, "원")
     emit_font("F_FOOT", "Pretendard-Medium.otf", 11, foot_chars)
 
     # 설정 페이지 - 테마 그림 (다크, 112px) · 머리 아이콘
     from datetime import datetime
     now = datetime.now(themes.KST)
-    q_us = dict(price=45.97, prev=40.87, closes=[41.2, 42.5, 41.8, 43.9, 44.6, 44.1, 45.2, 45.97], time=now)
-    q_kr = dict(price=1136000, prev=1132000, closes=[1129000, 1134000, 1131000, 1138000, 1140000, 1136000], time=now)
+    import random
+    def walk(start, step, n=44, seed=1):
+        r, v, out = random.Random(seed), start, []
+        for _ in range(n):
+            o = v
+            v = v + r.uniform(-step, step * 1.1)
+            out.append((o, max(o, v) + r.uniform(0, step * .5), min(o, v) - r.uniform(0, step * .5), v))
+        return out
+    q_us = dict(price=45.97, prev=40.87, closes=[], candles=walk(45.0, 0.12), time=now)
+    q_kr = dict(price=1136000, prev=1132000, closes=[], candles=walk(1130000, 1500, seed=4), time=now)
     shots = [
         themes.screen_pet("dark", now, (7.0, 4.8, 12.2)),
-        themes.screen_stock("dark", q_us, "SOXL", "반도체 3배 레버리지 · 미국", "$45.97", "", "예시"),
-        themes.screen_stock("dark", q_kr, "SK하이닉스", "000660 · 코스피", "1,136,000", "원", "예시"),
+        themes.screen_stock2("dark", q_us, "SOXL", "$45.97", "", "예시"),
+        themes.screen_stock2("dark", q_kr, "SK하이닉스", "1,136,000", "원", "예시"),
     ]
     for i, s in enumerate(shots):
         data = png_bytes(s.convert("RGB").resize((112, 112), Image.LANCZOS))
