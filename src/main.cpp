@@ -3,7 +3,7 @@
 //   - 업데이트: http://<IP>/update 에서 다음 펌웨어를 선 없이 올린다 (이게 없으면 다음부터 분해해야 한다)
 //   - 설정 페이지: http://<IP>/ - 테마 고르기 · 화면 밝기 모드 · 와이파이
 //   - 그림 · 글자는 tools/assets.py 가 만든 src/assets.h (부드러운 그림을 투명도째 담아 배경과 섞어 그린다)
-//   - 날씨: Open-Meteo(서울), 주가: Yahoo Finance 차트 - 둘 다 키 없이 HTTPS 로 받는다
+//   - 날씨: Open-Meteo(서울, 키 없음), 주가: 토스증권 Open API (차트 · 장 시간 · 기준가는 HTTPS, 체결은 웹소켓)
 //
 // 화면 핀 · 켜는 순서는 SmallTV-Ultra 한국어 커펌(wonjj6768)의 브리지 펌웨어에서 확인한 값이다.
 
@@ -21,11 +21,13 @@
 #include <base64.h>
 #include <time.h>
 
+#include <algorithm>
+
 #include "assets.h"
 
 namespace {
 
-constexpr const char* VERSION = "v0.19";
+constexpr const char* VERSION = "v0.21";
 constexpr const char* HOSTNAME = "pet";        // http://pet.local
 constexpr const char* SETUP_AP = "pet-setup";  // 와이파이를 못 찾으면 띄우는 와이파이 이름 (비밀번호 없음)
 constexpr uint32_t WIFI_WAIT_MS = 20000;
@@ -259,7 +261,7 @@ uint8_t weatherKind() {
   return W_RAIN;  // 이슬비 · 비 · 소나기
 }
 
-// ── 주가 (Yahoo Finance 차트, 5분 간격 하루치) ──────────
+// ── 주가 (토스증권 키가 있으면 토스, 없으면 Yahoo · 네이버) ──
 struct StockDef {
   const char* symbol;
   bool kr;
@@ -270,63 +272,120 @@ const StockDef STOCKS[2] = {
     {"SOXL", false, "SOXL", ""},
     {"000660", true, "SK하이닉스", ""},  // 국내는 네이버 증권 (넥스트레이드 프리 · 애프터 포함)
 };
-// 1분봉 캔들 - 최근 40개 (100분치를 받아 빈 분을 건너뛰고 끝에서 40개)
+// 1분봉 캔들 - 화면에는 최근 30개, 볼린저밴드 계산용으로 앞쪽 19개를 더 들고 있는다
 constexpr int CANDLES = 30;  // 작은 화면에서 또렷하게 - 최근 30분
+constexpr int BB_N = 20;     // 볼린저밴드: 종가 20개 평균 ± 2 표준편차
+constexpr int HIST = CANDLES + BB_N - 1;
 constexpr int C_PITCH = 7;  // 캔들 한 칸 7px (몸통 5px + 틈 2px)
 struct Candle {
-  float o, h, l, c;
+  float o, h, l, c, v;  // 시가 · 고가 · 저가 · 종가 · 거래량
 };
+// 화면에는 한 종목만 나오니 캔들 칸은 두 종목이 같이 쓴다 (메모리를 아낀다). 한 종목을 받으면 다른 종목 차트는 비운다
+Candle chartBuf[HIST];
 struct Quote {
-  bool ok = false, failed = false, metaOk = false;
+  bool ok = false, failed = false;
   float price = 0, prev = 0;  // 보여 줄 가격 · 비교 기준 (등락은 price - prev)
-  Candle candles[CANDLES];
+  Candle* candles = chartBuf;
   uint8_t n = 0;
   time_t at = 0;              // 가격 기준 시각
   time_t lastMin = 0;         // 마지막 1분봉의 시작 시각 (실시간 체결이 이 분이면 갱신, 다음 분이면 새 캔들)
-  char session[40] = "";      // 아래 줄에 붙는 " · 프리마켓" · " · 애프터마켓" · " · 데이마켓" · " · 장 마감"
-  bool live = false;          // 지금 거래 중 (정규장 · 프리 · 애프터) - 1분마다 받는다
-  // 미국 (Yahoo) - 하루 시세
-  float regPrice = 0, regPrev = 0;
-  time_t regTime = 0, preStart = 0, regStart = 0, regEnd = 0, postEnd = 0;
-  long gmtOff = 0;            // 뉴욕 시차 (초) - 겨울 -18000 · 여름 -14400
-  unsigned long fetchedAt = 0, metaAt = 0;
+  char session[40] = "";      // 아래 줄에 붙는 " · 데이마켓" · " · 프리마켓" · " · 애프터마켓" · " · 장 마감"
+  bool live = false;          // 지금 거래 중 - 소켓이 없을 때 1분마다 받는다
+  char baseDate[11] = "";     // 기준가를 받은 정규장 날짜
+  uint8_t fails = 0;          // 연속으로 못 받은 횟수 - 있으면 실시간을 붙이기 전에 다시 받는다
+  unsigned long fetchedAt = 0;
 } quotes[2];
 
-constexpr int CH_X0 = 10, CH_X1 = 230, CH_Y0 = 70, CH_Y1 = 214;
+constexpr int CH_X0 = 10, CH_X1 = 230, CH_Y0 = 70, CH_Y1 = 192;  // 캔들
+constexpr int VOL_Y0 = 198, VOL_Y1 = 215;                         // 거래량 막대 (아래 띠)
 int16_t cHi[CANDLES], cLo[CANDLES], cTop[CANDLES], cBot[CANDLES];
+int16_t bbU[CANDLES], bbM[CANDLES], bbL[CANDLES];  // 볼린저밴드 위 · 가운데 · 아래 (-1 은 앞쪽 종가가 20개가 안 됨)
+uint8_t cVol[CANDLES];                             // 거래량 막대 높이 (px)
 bool cUp[CANDLES];
 int cLeft = CH_X0, cCount = 0, prevLineY = -1;
 bool chartReady = false;
+constexpr uint16_t BAND_C = rgb(232, 168, 56);  // 볼린저밴드 - 빨강 · 파랑 캔들과 안 겹치는 호박색
 
 void buildChart(const Quote& q) {
   chartReady = q.n > 0;
   if (!chartReady) return;
-  float lo = q.candles[0].l, hi = q.candles[0].h;
-  for (int k = 0; k < q.n; k++) {
-    lo = min(lo, q.candles[k].l);
-    hi = max(hi, q.candles[k].h);
+  const int vis = min<int>(q.n, CANDLES), off = q.n - vis;  // 화면에 그리는 건 끝에서 30개
+  float up[CANDLES], mid[CANDLES], dn[CANDLES];
+  float lo = q.candles[off].l, hi = q.candles[off].h;
+  for (int k = 0; k < vis; k++) {
+    const int j = off + k;
+    lo = min(lo, q.candles[j].l);
+    hi = max(hi, q.candles[j].h);
+    mid[k] = NAN;
+    if (j < BB_N - 1) continue;
+    float sum = 0, sq = 0;
+    for (int m = j - BB_N + 1; m <= j; m++) sum += q.candles[m].c;
+    const float mean = sum / BB_N;
+    for (int m = j - BB_N + 1; m <= j; m++) sq += (q.candles[m].c - mean) * (q.candles[m].c - mean);
+    const float sd = sqrtf(sq / BB_N);
+    mid[k] = mean;
+    up[k] = mean + 2 * sd;
+    dn[k] = mean - 2 * sd;
+    lo = min(lo, dn[k]);  // 밴드도 화면 안에 들어오게 범위에 넣는다
+    hi = max(hi, up[k]);
   }
   const float span = hi - lo > 0 ? hi - lo : 1;
   auto Y = [&](float v) { return static_cast<int16_t>(lroundf(CH_Y1 - (v - lo) / span * (CH_Y1 - CH_Y0))); };
-  for (int k = 0; k < q.n; k++) {
-    const Candle& c = q.candles[k];
+  float vMax = 0;
+  for (int k = 0; k < vis; k++) vMax = max(vMax, q.candles[off + k].v);
+  for (int k = 0; k < vis; k++) {
+    const Candle& c = q.candles[off + k];
+    cVol[k] = vMax > 0 && c.v > 0 ? max(1L, lroundf(c.v / vMax * (VOL_Y1 - VOL_Y0))) : 0;
     cHi[k] = Y(c.h);
     cLo[k] = Y(c.l);
     cTop[k] = Y(max(c.o, c.c));
     cBot[k] = max(Y(min(c.o, c.c)), cTop[k]);
     cUp[k] = c.c >= c.o;
+    const bool has = !isnan(mid[k]);
+    bbU[k] = has ? Y(up[k]) : -1;
+    bbM[k] = has ? Y(mid[k]) : -1;
+    bbL[k] = has ? Y(dn[k]) : -1;
   }
-  cCount = q.n;
-  cLeft = CH_X0 + (CH_X1 - CH_X0 - CANDLES * C_PITCH) / 2 + (CANDLES - q.n) * C_PITCH;  // 모자라면 오른쪽으로 붙인다
+  cCount = vis;
+  cLeft = CH_X0 + (CH_X1 - CH_X0 - CANDLES * C_PITCH) / 2 + (CANDLES - vis) * C_PITCH;  // 모자라면 오른쪽으로 붙인다
   prevLineY = q.prev >= lo && q.prev <= hi ? Y(q.prev) : -1;  // 전날 종가는 범위 안일 때만
 }
 
+// 지금 띠에 걸치는 선분만 그린다 (dotted 면 2칸 그리고 2칸 띄운다)
+void seg(int x0, int y0, int x1, int y1, uint16_t c, bool dotted) {
+  if (max(y0, y1) < sy0 || min(y0, y1) >= sy0 + STRIP_H) return;
+  const int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  for (int i = 0;; i++) {
+    if (!dotted || (i & 2) == 0) plot(x0, y0, c, 255);
+    if (x0 == x1 && y0 == y1) break;
+    const int e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x0 += sx;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
 void drawChart() {
-  if (!chartReady || CH_Y1 < sy0 || CH_Y0 - 1 >= sy0 + STRIP_H) return;
+  if (!chartReady || VOL_Y1 < sy0 || CH_Y0 - 1 >= sy0 + STRIP_H) return;
   if (prevLineY >= sy0 && prevLineY < sy0 + STRIP_H) {
     for (int x = CH_X0; x < CH_X1; x += 6) {
       for (int dx = 0; dx < 3; dx++) plot(x + dx, prevLineY, col.grid, 255);
     }
+  }
+  // 볼린저밴드 - 캔들 뒤에 얇게 (위 · 아래는 이어서, 가운데는 점선). 배경과 미리 섞은 색이라 이음매가 진해지지 않는다
+  const uint16_t edge = blend(BAND_C, col.bg, 200), center = blend(BAND_C, col.bg, 130);
+  for (int k = 1; k < cCount; k++) {
+    if (bbM[k - 1] < 0 || bbM[k] < 0) continue;
+    const int x0 = cLeft + (k - 1) * C_PITCH + (C_PITCH - 2) / 2, x1 = x0 + C_PITCH;  // 캔들 심지 위치끼리
+    seg(x0, bbU[k - 1], x1, bbU[k], edge, false);
+    seg(x0, bbL[k - 1], x1, bbL[k], edge, false);
+    seg(x0, bbM[k - 1], x1, bbM[k], center, true);
   }
   const int r0 = sy0, r1 = sy0 + STRIP_H;
   for (int k = 0; k < cCount; k++) {
@@ -336,6 +395,10 @@ void drawChart() {
     for (int y = max(r0, static_cast<int>(cHi[k])); y <= min(r1 - 1, static_cast<int>(cLo[k])); y++) plot(cx + body / 2, y, c, 255);
     for (int y = max(r0, static_cast<int>(cTop[k])); y <= min(r1 - 1, static_cast<int>(cBot[k])); y++) {
       for (int dx = 0; dx < body; dx++) plot(cx + dx, y, c, 255);
+    }
+    // 거래량 - 아래 띠에 같은 색으로 연하게
+    for (int y = max(r0, VOL_Y1 - cVol[k] + 1); y <= min(r1 - 1, VOL_Y1); y++) {
+      for (int dx = 0; dx < body; dx++) plot(cx + dx, y, c, 110);
     }
   }
 }
@@ -458,7 +521,10 @@ void renderAll() {
 String lastNetErr = "";  // 설정 페이지에 보이는 마지막 받기 문제
 bool safeMode = false;   // 연속으로 멈춰 다시 켜졌으면 받기를 멈춘다
 
-bool httpsJson(const char* host, const String& path, JsonDocument& doc, JsonDocument& filter, const String* postBody = nullptr) {
+// 응답 본문을 read(stream) 에 넘긴다. bearer 가 있으면 인증 머리줄을 붙이고, status 에 응답 코드를 돌려준다
+template <typename Read>
+bool httpsStream(const char* host, const String& path, Read read, const String* postBody = nullptr, const char* bearer = nullptr,
+                 int* status = nullptr) {
   if (safeMode || WiFi.status() != WL_CONNECTED) return false;
   BearSSL::WiFiClientSecure client;
   client.setInsecure();  // 인증서 확인 생략 - 공개 시세 · 날씨만 받는다
@@ -475,6 +541,7 @@ bool httpsJson(const char* host, const String& path, JsonDocument& doc, JsonDocu
   http.setTimeout(10000);
   http.setUserAgent("Mozilla/5.0");
   if (!http.begin(client, host, 443, path, true)) return false;
+  if (bearer) http.addHeader("Authorization", String("Bearer ") + bearer);
   int code;
   if (postBody) {
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
@@ -482,11 +549,16 @@ bool httpsJson(const char* host, const String& path, JsonDocument& doc, JsonDocu
   } else {
     code = http.GET();
   }
+  if (status) *status = code;
   bool ok = false;
-  if (code == 200) ok = !deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  if (code == 200) ok = read(http.getStream());
   if (!ok) lastNetErr = String(host) + " 응답 " + code;
   http.end();
   return ok;
+}
+
+bool httpsJson(const char* host, const String& path, JsonDocument& doc, JsonDocument& filter, const String* postBody = nullptr) {
+  return httpsStream(host, path, [&](Stream& s) { return !deserializeJson(doc, s, DeserializationOption::Filter(filter)); }, postBody);
 }
 
 bool fetchWeather() {
@@ -522,246 +594,6 @@ float parseNum(const char* s) {  // "1,114,000" · "-18,000" → 숫자
   return atof(buf);
 }
 
-// 받은 캔들 배열에서 빈 분을 건너뛰고 끝에서 40개만 담는다
-template <typename Get>
-void keepLastCandles(Quote& q, int total, Get get) {
-  Candle c;
-  int valid = 0;
-  for (int k = 0; k < total; k++) valid += get(k, c);
-  int skip = max(0, valid - CANDLES);
-  q.n = 0;
-  for (int k = 0; k < total; k++) {
-    if (!get(k, c)) continue;
-    if (skip > 0) {
-      skip--;
-      continue;
-    }
-    q.candles[q.n++] = c;
-  }
-}
-
-// ── 미국 (Yahoo) - 프리마켓 · 정규장 · 애프터마켓 · 데이마켓 ─
-enum UsSession : uint8_t { US_CLOSED, US_PRE, US_REG, US_POST, US_DAY };
-
-// 데이마켓 (블루오션 ATS): 뉴욕 시각 일 ~ 목 20:00 ~ 다음 날 04:00
-// 한국 시각으로 겨울 10:00 ~ 18:00 · 여름 09:00 ~ 17:00. 미국 휴일은 따로 거르지 않는다
-bool usDayMarket(time_t now, long gmtOff) {
-  if (gmtOff == 0) return false;
-  const time_t et = now + gmtOff;
-  const struct tm* t = gmtime(&et);
-  const int wd = t->tm_wday, h = t->tm_hour;
-  return (h >= 20 && wd <= 4) || (h < 4 && wd >= 1 && wd <= 5);
-}
-
-UsSession usSession(const Quote& q, time_t now) {
-  if (!timeReady()) return US_CLOSED;
-  if (now >= q.preStart && now < q.regStart) return US_PRE;
-  if (now >= q.regStart && now <= q.regEnd) return US_REG;
-  if (now > q.regEnd && now <= q.postEnd) return US_POST;
-  if (usDayMarket(now, q.gmtOff)) return US_DAY;
-  return US_CLOSED;
-}
-
-const char* usSessionLabel(UsSession s) {
-  switch (s) {
-    case US_PRE: return " · 프리마켓";
-    case US_REG: return "";
-    case US_POST: return " · 애프터마켓";
-    case US_DAY: return " · 데이마켓";
-    default: return " · 장 마감";
-  }
-}
-
-// 하루 시세(30분마다): 정규장 가격 · 전날 종가 · 프리/정규/애프터 시간 · 뉴욕 시차
-bool fetchUsMeta(Quote& q, const char* symbol) {
-  JsonDocument filter;
-  JsonObject m = filter["chart"]["result"][0]["meta"].to<JsonObject>();
-  m["gmtoffset"] = true;
-  m["regularMarketPrice"] = true;
-  m["chartPreviousClose"] = true;
-  m["regularMarketTime"] = true;
-  m["currentTradingPeriod"]["pre"]["start"] = true;
-  m["currentTradingPeriod"]["regular"]["start"] = true;
-  m["currentTradingPeriod"]["regular"]["end"] = true;
-  m["currentTradingPeriod"]["post"]["end"] = true;
-  JsonDocument doc;
-  if (!httpsJson("query1.finance.yahoo.com", String("/v8/finance/chart/") + symbol + "?interval=1d&range=1d", doc, filter)) {
-    return false;
-  }
-  JsonObject meta = doc["chart"]["result"][0]["meta"];
-  if (meta["regularMarketPrice"].isNull()) return false;
-  q.regPrice = meta["regularMarketPrice"];
-  q.regPrev = meta["chartPreviousClose"];
-  q.regTime = meta["regularMarketTime"].as<long>();
-  q.preStart = meta["currentTradingPeriod"]["pre"]["start"].as<long>();
-  q.regStart = meta["currentTradingPeriod"]["regular"]["start"].as<long>();
-  q.regEnd = meta["currentTradingPeriod"]["regular"]["end"].as<long>();
-  q.postEnd = meta["currentTradingPeriod"]["post"]["end"].as<long>();
-  q.gmtOff = meta["gmtoffset"] | 0L;
-  q.metaOk = true;
-  q.metaAt = millis();
-  return true;
-}
-
-bool fetchUs(Quote& q, const char* symbol) {
-  if (!q.metaOk || millis() - q.metaAt > 30UL * 60000) {
-    if (!fetchUsMeta(q, symbol) && !q.metaOk) return false;
-  }
-  const time_t now = time(nullptr);
-  const UsSession s = usSession(q, now);
-  const bool reg = s == US_REG;
-  // Yahoo 1분봉이 있는 시간만 1분마다 받는다 - 데이마켓 체결은 토스 웹소켓으로만 온다
-  q.live = s == US_PRE || reg || s == US_POST;
-  // 거래 중이면 지금까지, 아니면 지난 애프터마켓 끝(정규장 마감 + 4시간)까지 100분치
-  const time_t end = (q.live ? now : q.regTime + 4 * 3600) + 60;
-
-  JsonDocument filter;
-  JsonObject r = filter["chart"]["result"][0].to<JsonObject>();
-  r["meta"]["regularMarketPrice"] = true;
-  r["meta"]["regularMarketTime"] = true;
-  r["timestamp"] = true;
-  JsonObject f = r["indicators"]["quote"][0].to<JsonObject>();
-  f["open"] = f["high"] = f["low"] = f["close"] = true;
-  JsonDocument doc;
-  const String path = String("/v8/finance/chart/") + symbol + "?interval=1m&includePrePost=true&period1=" +
-                      String(static_cast<long>(end - 3600)) + "&period2=" + String(static_cast<long>(end));
-  time_t lastAt = 0;
-  float lastClose = 0;
-  if (httpsJson("query1.finance.yahoo.com", path, doc, filter)) {
-    JsonObject res = doc["chart"]["result"][0];
-    JsonArray o = res["indicators"]["quote"][0]["open"], h = res["indicators"]["quote"][0]["high"],
-              l = res["indicators"]["quote"][0]["low"], c = res["indicators"]["quote"][0]["close"];
-    JsonArray ts = res["timestamp"];
-    keepLastCandles(q, c.size(), [&](int k, Candle& out) {
-      if (o[k].isNull() || h[k].isNull() || l[k].isNull() || c[k].isNull()) return false;
-      out = {o[k].as<float>(), h[k].as<float>(), l[k].as<float>(), c[k].as<float>()};
-      lastAt = ts[k].as<long>();
-      lastClose = out.c;
-      return true;
-    });
-    if (lastAt) q.lastMin = lastAt - lastAt % 60;
-    if (!res["meta"]["regularMarketPrice"].isNull()) {
-      q.regPrice = res["meta"]["regularMarketPrice"];
-      q.regTime = res["meta"]["regularMarketTime"].as<long>();
-    }
-  }
-  if (reg || lastAt == 0) {
-    // 정규장 (또는 캔들을 못 받음): 정규장 가격, 전날 종가와 비교
-    q.price = q.regPrice;
-    q.prev = q.regPrev;
-    q.at = q.regTime;
-    strcpy(q.session, reg ? "" : s == US_DAY ? usSessionLabel(s) : " · 장 마감");
-  } else {
-    // 프리 · 애프터 · 데이 · 장 밖: 마지막 1분봉 가격, 직전 정규장 종가와 비교
-    q.price = lastClose;
-    q.prev = q.regPrice;
-    q.at = lastAt;
-    strcpy(q.session, usSessionLabel(s));
-  }
-  return true;
-}
-
-// ── 국내 (네이버 증권) - 정규장 · 넥스트레이드 프리/애프터 ──
-bool fetchKr(Quote& q, const char* code) {
-  JsonDocument filter;
-  JsonObject d = filter["datas"][0].to<JsonObject>();
-  d["closePriceRaw"] = true;
-  d["compareToPreviousClosePriceRaw"] = true;
-  d["marketStatus"] = true;
-  d["localTradedAt"] = true;
-  d["overMarketPriceInfo"]["tradingSessionType"] = true;
-  d["overMarketPriceInfo"]["overMarketStatus"] = true;
-  d["overMarketPriceInfo"]["overPrice"] = true;
-  d["overMarketPriceInfo"]["compareToPreviousClosePrice"] = true;
-  JsonDocument doc;
-  if (!httpsJson("polling.finance.naver.com", String("/api/realtime/domestic/stock/") + code, doc, filter)) return false;
-  JsonObject s = doc["datas"][0];
-  if (s["closePriceRaw"].isNull()) return false;
-
-  const float close = parseNum(s["closePriceRaw"] | "0");
-  const float diff = parseNum(s["compareToPreviousClosePriceRaw"] | "0");
-  const bool regOpen = strcmp(s["marketStatus"] | "", "OPEN") == 0;
-  JsonObject over = s["overMarketPriceInfo"];
-  const bool hasOver = !over.isNull() && !over["overPrice"].isNull();
-  const bool overOpen = hasOver && strcmp(over["overMarketStatus"] | "", "OPEN") == 0;
-  const bool isPre = hasOver && strcmp(over["tradingSessionType"] | "", "PRE_MARKET") == 0;
-  if (regOpen || !hasOver) {
-    q.price = close;
-    q.prev = close - diff;
-    strcpy(q.session, regOpen ? "" : " · 장 마감");
-  } else {
-    // 넥스트레이드 프리 · 애프터 - 네이버처럼 전날 종가와 비교
-    const float op = parseNum(over["overPrice"] | "0");
-    q.price = op;
-    q.prev = op - parseNum(over["compareToPreviousClosePrice"] | "0");
-    snprintf(q.session, sizeof(q.session), "%s%s", isPre ? " · 프리마켓" : " · 애프터마켓", overOpen ? "" : " 마감");
-  }
-  q.live = regOpen || overOpen;
-
-  // 마지막 거래 시각 "2026-11-09T20:00:00+09:00"
-  struct tm tt = {};
-  int Y, M, D, h, m, sec;
-  if (sscanf(s["localTradedAt"] | "", "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) == 6) {
-    tt.tm_year = Y - 1900;
-    tt.tm_mon = M - 1;
-    tt.tm_mday = D;
-    tt.tm_hour = h;
-    tt.tm_min = m;
-    tt.tm_sec = sec;
-    tt.tm_isdst = 0;
-    q.at = mktime(&tt);  // 기기 시간대가 한국(KST-9)이라 그대로 맞는다
-  }
-
-  // 1분봉 - 마지막 거래 시각까지 100분치 (네이버 시간 형식 yyyyMMddHHmm)
-  if (q.at > 0) {
-    char from[16], to[16];
-    const time_t end = q.at + 60, start = end - 3600;
-    strftime(from, sizeof(from), "%Y%m%d%H%M", localtime(&start));
-    strftime(to, sizeof(to), "%Y%m%d%H%M", localtime(&end));
-    JsonDocument cf;
-    cf[0]["openPrice"] = cf[0]["highPrice"] = cf[0]["lowPrice"] = cf[0]["currentPrice"] = cf[0]["localDateTime"] = true;
-    JsonDocument cd;
-    if (httpsJson("api.stock.naver.com", String("/chart/domestic/item/") + code + "/minute?startDateTime=" + from + "&endDateTime=" + to,
-                  cd, cf)) {
-      JsonArray arr = cd.as<JsonArray>();
-      keepLastCandles(q, arr.size(), [&](int k, Candle& out) {
-        JsonObject it = arr[k];
-        if (it["currentPrice"].isNull() || it["openPrice"].isNull()) return false;
-        out = {it["openPrice"].as<float>(), it["highPrice"].as<float>(), it["lowPrice"].as<float>(), it["currentPrice"].as<float>()};
-        int Y2, M2, D2, h2, m2;
-        if (sscanf(it["localDateTime"] | "", "%4d%2d%2d%2d%2d", &Y2, &M2, &D2, &h2, &m2) == 5) {
-          struct tm lt = {};
-          lt.tm_year = Y2 - 1900;
-          lt.tm_mon = M2 - 1;
-          lt.tm_mday = D2;
-          lt.tm_hour = h2;
-          lt.tm_min = m2;
-          q.lastMin = mktime(&lt);
-        }
-        return true;
-      });
-    }
-  }
-  q.metaOk = true;
-  return true;
-}
-
-bool fetchQuote(int i) {
-  Quote& q = quotes[i];
-  const bool ok = STOCKS[i].kr ? fetchKr(q, STOCKS[i].symbol) : fetchUs(q, STOCKS[i].symbol);
-  if (!ok) {
-    q.failed = !q.ok;
-    return false;
-  }
-  q.ok = true;
-  q.failed = false;
-  q.fetchedAt = millis();
-  return true;
-}
-
-// 다음에 받을 때까지 - 거래 중(프리 · 정규 · 애프터) 1분, 아니면 10분
-unsigned long quoteInterval(const Quote& q) { return q.live ? 60000 : 600000; }
-
 // ── 토스증권 실시간 체결 (웹소켓) ──────────────────────
 // 토큰(24시간)을 받아 wss://openapi-ws.tossinvest.com/ws/v1 에 붙고, 지금 테마 종목의 체결을 구독한다.
 // 서버가 작은 조각 전송(MFLN)을 안 해서 받기 버퍼를 8KB 로 둔다 (인증서 묶음 3.7KB · 체결 프레임 200바이트 안팎)
@@ -794,6 +626,213 @@ bool fetchTossToken() {
   tossTokenExp = millis() + static_cast<unsigned long>(max(60L, life - 600)) * 1000UL;  // 만료 10분 전에 새로
   return true;
 }
+
+// ── 토스증권 시세 (REST) ───────────────────────────────
+// 차트(1분봉) · 장 시간(장 운영 캘린더) · 비교 기준가(일봉)를 모두 토스에서 받는다.
+// 받는 동안은 소켓이 닫혀 있다 (HTTPS 와 소켓을 같이 들 메모리가 없다)
+constexpr const char* TOSS_HOST = "openapi.tossinvest.com";
+
+// "2026-11-09T22:28:43.064+09:00" · "2026-11-10T00:00:00-05:00" → 세계 표준시 초 (못 읽으면 0)
+time_t parseIso(const char* s) {
+  int Y, M, D, h, m, sec;
+  if (!s || sscanf(s, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) != 6) return 0;
+  const long y = Y - (M <= 2);  // 날짜 → 1970-01-01 부터 날 수
+  const long era = (y >= 0 ? y : y - 399) / 400;
+  const long yoe = y - era * 400;
+  const long doy = (153L * (M + (M > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+  const long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  long t = (era * 146097L + doe - 719468L) * 86400L + h * 3600L + m * 60L + sec;
+  const char* z = s + 19;
+  while (*z == '.' || isdigit(static_cast<unsigned char>(*z))) z++;  // 소수 초는 버린다
+  if (*z == '+' || *z == '-') {
+    int oh = 0, om = 0;
+    sscanf(z + 1, "%d:%d", &oh, &om);
+    t += (*z == '+' ? -1L : 1L) * (oh * 3600L + om * 60L);
+  }
+  return static_cast<time_t>(t);
+}
+
+bool tossTokenOk() { return (tossToken.length() && millis() < tossTokenExp) || fetchTossToken(); }
+
+template <typename Read>
+bool tossGet(const String& path, Read read) {
+  if (!tossReady() || !tossTokenOk()) return false;
+  int code = 0;
+  const bool ok = httpsStream(TOSS_HOST, path, read, nullptr, tossToken.c_str(), &code);
+  if (code == 401) tossToken = "";  // 토큰이 무효 - 다음에 새로 받는다
+  return ok;
+}
+
+// "candles": [...] 를 한 칸씩 읽는다 (통째로 담을 메모리가 없다). each 가 false 면 그만 읽는다
+template <typename Each>
+bool readCandles(Stream& s, JsonDocument& filter, Each each) {
+  if (!s.find("\"candles\"") || !s.find("[")) return false;
+  do {
+    JsonDocument e;
+    if (deserializeJson(e, s, DeserializationOption::Filter(filter)) || e["closePrice"].isNull()) break;
+    if (!each(e.as<JsonObject>())) break;
+  } while (s.findUntil(",", "]"));
+  return true;
+}
+
+// 장 운영 캘린더 - 전 · 오늘 · 다음 영업일의 세션 시각 (미국: 데이 · 프리 · 정규 · 애프터, 국내 통합: 프리 · 정규 · 애프터)
+enum Session : uint8_t { S_CLOSED, S_DAY, S_PRE, S_REG, S_POST };
+struct BizDay {
+  char date[11] = "";
+  uint32_t start[5] = {}, end[5] = {};  // Session 순서 (S_CLOSED 칸은 비운다)
+};
+struct {
+  BizDay days[3];
+  int8_t stock = -1;  // 어느 종목 시장의 캘린더인지 (STOCKS 번호)
+  unsigned long at = 0;
+} cal;
+
+bool fetchCalendar(int i) {
+  static const char* const DAYS[3] = {"previousBusinessDay", "today", "nextBusinessDay"};
+  static const char* const NAMES[5] = {"", "dayMarket", "preMarket", "regularMarket", "afterMarket"};
+  const bool kr = STOCKS[i].kr;
+  JsonDocument filter;
+  for (const char* d : DAYS) {
+    filter["result"][d]["date"] = true;
+    for (int k = 1; k < 5; k++) {
+      JsonObject x = kr ? filter["result"][d]["integrated"][NAMES[k]].to<JsonObject>() : filter["result"][d][NAMES[k]].to<JsonObject>();
+      x["startTime"] = true;
+      x["endTime"] = true;
+    }
+  }
+  JsonDocument doc;
+  if (!tossGet(String("/api/v1/market-calendar/") + (kr ? "KR" : "US"),
+               [&](Stream& s) { return !deserializeJson(doc, s, DeserializationOption::Filter(filter)); })) {
+    return false;
+  }
+  for (int j = 0; j < 3; j++) {
+    JsonObject d = doc["result"][DAYS[j]];
+    JsonObject src = kr ? d["integrated"] : d;
+    strlcpy(cal.days[j].date, d["date"] | "", sizeof(cal.days[j].date));
+    for (int k = 1; k < 5; k++) {
+      JsonObject x = src[NAMES[k]];  // 휴장이면 null
+      cal.days[j].start[k] = static_cast<uint32_t>(parseIso(x["startTime"] | ""));
+      cal.days[j].end[k] = static_cast<uint32_t>(parseIso(x["endTime"] | ""));
+    }
+  }
+  if (!cal.days[1].date[0]) return false;
+  cal.stock = i;
+  cal.at = millis();
+  return true;
+}
+
+Session sessionAt(int i, time_t t) {
+  if (cal.stock != i) return S_CLOSED;
+  for (const BizDay& d : cal.days) {
+    for (int k = 1; k < 5; k++) {
+      if (d.start[k] && t >= static_cast<time_t>(d.start[k]) && t < static_cast<time_t>(d.end[k])) return static_cast<Session>(k);
+    }
+  }
+  return S_CLOSED;
+}
+
+const char* sessionLabel(Session s) {
+  switch (s) {
+    case S_DAY: return " · 데이마켓";
+    case S_PRE: return " · 프리마켓";
+    case S_REG: return "";
+    case S_POST: return " · 애프터마켓";
+    default: return " · 장 마감";
+  }
+}
+
+// 비교 기준가를 잡을 날 - 이미 끝난 정규장 가운데 가장 최근 날
+// (데이 · 프리 · 정규 중에는 전 영업일 종가, 정규장이 끝난 뒤 애프터에는 그날 종가와 비교한다)
+const char* baseDate(time_t now) {
+  const char* date = nullptr;
+  uint32_t best = 0;
+  for (const BizDay& d : cal.days) {
+    const uint32_t e = d.end[S_REG];
+    if (e && static_cast<time_t>(e) <= now && e > best) {
+      best = e;
+      date = d.date;
+    }
+  }
+  return date;
+}
+
+// 1분봉 49개 (최신순으로 온다) → 오래된 것부터 chartBuf 에
+bool fetchCandles(Quote& q, const char* symbol) {
+  JsonDocument filter;
+  filter["timestamp"] = filter["openPrice"] = filter["highPrice"] = filter["lowPrice"] = filter["closePrice"] = filter["volume"] = true;
+  int got = 0;
+  time_t newest = 0;
+  const bool ok = tossGet(String("/api/v1/candles?symbol=") + symbol + "&interval=1m&count=" + HIST, [&](Stream& s) {
+    return readCandles(s, filter, [&](JsonObject e) {
+      if (got == 0) newest = parseIso(e["timestamp"] | "");
+      chartBuf[got++] = {parseNum(e["openPrice"] | "0"), parseNum(e["highPrice"] | "0"), parseNum(e["lowPrice"] | "0"),
+                         parseNum(e["closePrice"] | "0"), parseNum(e["volume"] | "0")};
+      return got < HIST;
+    });
+  });
+  if (!ok || got == 0 || newest == 0) {
+    if (got > 0) q.n = 0;  // 받다가 끊겨 칸이 섞였으면 비운다. 연결부터 못 했으면 전 차트를 그대로 둔다
+    return false;
+  }
+  std::reverse(chartBuf, chartBuf + got);
+  q.n = got;
+  q.lastMin = newest - 60;  // 1분봉 시각은 끝나는 시각 - 실시간 체결(시작 시각 기준)과 맞춘다
+  q.price = chartBuf[got - 1].c;
+  q.at = min(time(nullptr), newest);
+  return true;
+}
+
+// 기준가 - 그날 일봉 종가
+bool fetchBase(Quote& q, const char* symbol, const char* date) {
+  JsonDocument filter;
+  filter["timestamp"] = filter["closePrice"] = true;
+  float found = 0;
+  tossGet(String("/api/v1/candles?symbol=") + symbol + "&interval=1d&count=4", [&](Stream& s) {
+    return readCandles(s, filter, [&](JsonObject e) {
+      if (strncmp(e["timestamp"] | "", date, 10) == 0) found = parseNum(e["closePrice"] | "0");
+      return found == 0;
+    });
+  });
+  if (found <= 0) return false;
+  q.prev = found;
+  strlcpy(q.baseDate, date, sizeof(q.baseDate));
+  return true;
+}
+
+bool fetchQuote(int i) {
+  Quote& q = quotes[i];
+  quotes[1 - i].n = 0;  // 캔들 칸은 같이 쓴다 - 다른 종목 차트는 비운다
+  bool ok = timeReady() && tossReady() && fetchCandles(q, STOCKS[i].symbol);
+  if (ok && !q.ok) {  // 켜진 뒤 처음이면 캔들부터 바로 그린다 (장 시간 · 기준가는 곧이어 받는다)
+    q.ok = true;
+    if (q.prev == 0) q.prev = q.price;
+    buildChart(q);
+    renderAll();
+  }
+  if (ok && (cal.stock != i || millis() - cal.at > 30UL * 60000)) fetchCalendar(i);  // 못 받으면 전 캘린더를 쓴다
+  if (ok) {
+    const time_t now = time(nullptr);
+    const char* bd = baseDate(now);
+    if (bd && (q.prev == 0 || strcmp(bd, q.baseDate) != 0)) fetchBase(q, STOCKS[i].symbol, bd);  // 못 받으면 다음에 다시
+    if (q.prev == 0) q.prev = q.price;  // 기준가를 아직 못 받았으면 등락 0 으로
+    const Session s = sessionAt(i, now);
+    q.live = s != S_CLOSED;
+    strcpy(q.session, sessionLabel(s));
+  }
+  if (!ok) {
+    q.failed = !q.ok;
+    if (q.fails < 255) q.fails++;
+    return false;
+  }
+  q.ok = true;
+  q.failed = false;
+  q.fails = 0;
+  q.fetchedAt = millis();
+  return true;
+}
+
+// 다음에 받을 때까지 - 거래 중 1분, 아니면 10분 (소켓이 붙어 있으면 30분마다)
+unsigned long quoteInterval(const Quote& q) { return q.live ? 60000 : 600000; }
 
 void wsClose() {
   if (!ws) return;
@@ -889,43 +928,30 @@ bool wsOpen(int i) {
 }
 
 // 체결 하나 - 가격과 마지막 1분봉을 갱신한다 (다음 분이면 새 캔들)
-void onTrade(int i, float price, time_t t) {
+void onTrade(int i, float price, float volume, time_t t) {
   Quote& q = quotes[i];
   q.price = price;
   q.at = t;
   const time_t m = t - t % 60;
   if (q.n == 0 || m > q.lastMin) {
-    if (q.n == CANDLES) {
-      memmove(q.candles, q.candles + 1, sizeof(Candle) * (CANDLES - 1));
+    if (q.n == HIST) {
+      memmove(q.candles, q.candles + 1, sizeof(Candle) * (HIST - 1));
       q.n--;
     }
-    q.candles[q.n++] = {price, price, price, price};
+    q.candles[q.n++] = {price, price, price, price, volume};
     q.lastMin = m;
   } else if (m == q.lastMin) {
     Candle& c = q.candles[q.n - 1];
     c.h = max(c.h, price);
     c.l = min(c.l, price);
     c.c = price;
+    c.v += volume;
   }
-  // 소켓은 30분마다만 새로 붙으니, 애프터 → 데이처럼 시간대가 바뀌면 체결 시각으로 바로 고친다
-  if (!STOCKS[i].kr && q.metaOk) strcpy(q.session, usSessionLabel(usSession(q, t)));
+  // 시세는 30분마다만 새로 받으니, 애프터 → 데이처럼 세션이 바뀌면 체결 시각으로 바로 고친다
+  strcpy(q.session, sessionLabel(sessionAt(i, t)));
   wsTrades++;
   tradeDirty = true;
 }
-
-time_t parseIsoKst(const char* s) {  // "2026-11-09T22:28:43.064+09:00" (토스는 한국 시각으로 준다)
-  int Y, M, D, h, m, sec;
-  if (sscanf(s, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &sec) != 6) return time(nullptr);
-  struct tm tt = {};
-  tt.tm_year = Y - 1900;
-  tt.tm_mon = M - 1;
-  tt.tm_mday = D;
-  tt.tm_hour = h;
-  tt.tm_min = m;
-  tt.tm_sec = sec;
-  return mktime(&tt);
-}
-
 
 void wsHandleText(size_t n) {
   if (n == 0 || wsBuf[0] != '{') return;
@@ -934,7 +960,8 @@ void wsHandleText(size_t n) {
   const char* type = doc["type"] | "";
   if (strcmp(type, "message") == 0 && wsSym >= 0) {
     const char* p = doc["data"]["price"] | "";
-    if (*p) onTrade(wsSym, atof(p), parseIsoKst(doc["data"]["timestamp"] | ""));
+    const time_t t = parseIso(doc["data"]["timestamp"] | "");
+    if (*p) onTrade(wsSym, atof(p), atof(doc["data"]["volume"] | "0"), t ? t : time(nullptr));
   } else if (strcmp(type, "error") == 0) {
     const char* code = doc["error"]["code"] | "";
     if (strcmp(code, "auth-revoked") == 0) tossToken = "";
@@ -1198,6 +1225,13 @@ void handleRoot() {
     d += rowHtml("SOXL", agoText(quotes[0].ok, quotes[0].failed, quotes[0].fetchedAt));
     d += rowHtml("SK하이닉스", agoText(quotes[1].ok, quotes[1].failed, quotes[1].fetchedAt));
     d += rowHtml("토스 실시간", !tossReady() ? String("키 없음") : ws ? "연결됨 · 체결 " + String(wsTrades) + "건" : tossStatus);
+    if (theme != TH_PET) {
+      const Quote& q = quotes[theme - 1];
+      char last[8] = "-";
+      if (q.n) strftime(last, sizeof(last), "%H:%M", localtime(&q.lastMin));
+      d += rowHtml("차트", String(q.n) + "개 · 마지막 " + last);
+      d += rowHtml("기준가", q.baseDate[0] ? String(q.baseDate) + " 종가 " + String(q.prev, 2) : String("아직 없음"));
+    }
   }
   d += rowHtml("주소", ipText()) + rowHtml("켜진 지", uptimeText()) +
        rowHtml("남은 메모리", String(ESP.getFreeHeap() / 1024) + " KB (한 덩어리 " + String(ESP.getMaxFreeBlockSize() / 1024) + " KB)") +
@@ -1269,7 +1303,7 @@ void handleTheme() {
   if (theme != TH_PET) {
     const Quote& q = quotes[theme - 1];
     buildChart(q);
-    if (!q.ok || millis() - q.fetchedAt > 60000) nextQuote = 0;  // 1분 넘게 지났으면 바로 다시 받는다
+    if (!q.ok || q.n == 0 || millis() - q.fetchedAt > 60000) nextQuote = 0;  // 차트가 비었거나 1분 넘게 지났으면 바로 다시 받는다
   } else if (!weather.ok) {
     nextWeather = 0;
   }
@@ -1303,6 +1337,28 @@ void handleToss() {
   wsRetryAt = 0;
   tossStatus = "키 저장함 - 곧 연결해요";
   sendNotice("토스 키를 저장했어요", "주가 테마에서 실시간 체결을 받기 시작해요.", 3);
+}
+
+// 토스 시세 원본 보기 (확인용) - 시세 · 캔들 · 장 캘린더 주소만 연다 (계좌 · 주문은 막는다)
+void handleTossRaw() {
+  const String p = server.arg("p");
+  if (!(p.startsWith("/api/v1/candles?") || p.startsWith("/api/v1/prices?") || p.startsWith("/api/v1/trades?") ||
+        p.startsWith("/api/v1/market-calendar/"))) {
+    server.send(400, "text/plain; charset=utf-8", "시세 · 캔들 · 장 캘린더 주소만 볼 수 있어요");
+    return;
+  }
+  wsClose();  // 소켓이 쓰던 메모리를 돌려받는다 - 다음 반복에서 다시 붙는다
+  String out;
+  const bool ok = tossGet(p, [&](Stream& s) {
+    char buf[128];
+    while (out.length() < 3000) {
+      const size_t n = s.readBytes(buf, sizeof(buf));
+      if (n == 0) break;
+      out.concat(buf, n);
+    }
+    return true;
+  });
+  server.send(ok ? 200 : 502, "application/json; charset=utf-8", ok ? out : "{\"error\":\"" + lastNetErr + "\"}");
 }
 
 void handleUpdatePage() {
@@ -1397,7 +1453,9 @@ void tickMinute() {
 
 // 주가 테마 + 토스 키가 있으면 소켓을 붙여 둔다
 void tossLoop() {
-  const bool want = theme != TH_PET && tossReady() && !safeMode && quotes[theme - 1].ok;
+  // 시세를 못 받았으면 소켓을 붙이기 전에 다시 받는다 (붙으면 30분 동안 다시 받지 않는다). 3번 연속 못 받으면 전 차트로 실시간만 잇는다
+  const bool want = theme != TH_PET && tossReady() && !safeMode && quotes[theme - 1].ok &&
+                    (quotes[theme - 1].fails == 0 || quotes[theme - 1].fails >= 3);
   if (!want) {
     wsClose();
     return;
@@ -1472,6 +1530,7 @@ void setup() {
   server.on("/poke", handlePoke);
   server.on("/thumb", handleThumb);
   server.on("/toss", HTTP_POST, handleToss);
+  server.on("/toss/raw", HTTP_GET, handleTossRaw);
   server.onNotFound([] { server.sendHeader("Location", "/"); server.send(302); });
   server.begin();
 
