@@ -25,7 +25,7 @@
 
 namespace {
 
-constexpr const char* VERSION = "v0.18";
+constexpr const char* VERSION = "v0.19";
 constexpr const char* HOSTNAME = "pet";        // http://pet.local
 constexpr const char* SETUP_AP = "pet-setup";  // 와이파이를 못 찾으면 띄우는 와이파이 이름 (비밀번호 없음)
 constexpr uint32_t WIFI_WAIT_MS = 20000;
@@ -283,11 +283,12 @@ struct Quote {
   uint8_t n = 0;
   time_t at = 0;              // 가격 기준 시각
   time_t lastMin = 0;         // 마지막 1분봉의 시작 시각 (실시간 체결이 이 분이면 갱신, 다음 분이면 새 캔들)
-  char session[40] = "";      // 아래 줄에 붙는 " · 프리마켓" · " · 애프터마켓" · " · 장 마감"
+  char session[40] = "";      // 아래 줄에 붙는 " · 프리마켓" · " · 애프터마켓" · " · 데이마켓" · " · 장 마감"
   bool live = false;          // 지금 거래 중 (정규장 · 프리 · 애프터) - 1분마다 받는다
   // 미국 (Yahoo) - 하루 시세
   float regPrice = 0, regPrev = 0;
   time_t regTime = 0, preStart = 0, regStart = 0, regEnd = 0, postEnd = 0;
+  long gmtOff = 0;            // 뉴욕 시차 (초) - 겨울 -18000 · 여름 -14400
   unsigned long fetchedAt = 0, metaAt = 0;
 } quotes[2];
 
@@ -539,11 +540,43 @@ void keepLastCandles(Quote& q, int total, Get get) {
   }
 }
 
-// ── 미국 (Yahoo) - 프리마켓 · 정규장 · 애프터마켓 ─────────
-// 하루 시세(30분마다): 정규장 가격 · 전날 종가 · 프리/정규/애프터 시간
+// ── 미국 (Yahoo) - 프리마켓 · 정규장 · 애프터마켓 · 데이마켓 ─
+enum UsSession : uint8_t { US_CLOSED, US_PRE, US_REG, US_POST, US_DAY };
+
+// 데이마켓 (블루오션 ATS): 뉴욕 시각 일 ~ 목 20:00 ~ 다음 날 04:00
+// 한국 시각으로 겨울 10:00 ~ 18:00 · 여름 09:00 ~ 17:00. 미국 휴일은 따로 거르지 않는다
+bool usDayMarket(time_t now, long gmtOff) {
+  if (gmtOff == 0) return false;
+  const time_t et = now + gmtOff;
+  const struct tm* t = gmtime(&et);
+  const int wd = t->tm_wday, h = t->tm_hour;
+  return (h >= 20 && wd <= 4) || (h < 4 && wd >= 1 && wd <= 5);
+}
+
+UsSession usSession(const Quote& q, time_t now) {
+  if (!timeReady()) return US_CLOSED;
+  if (now >= q.preStart && now < q.regStart) return US_PRE;
+  if (now >= q.regStart && now <= q.regEnd) return US_REG;
+  if (now > q.regEnd && now <= q.postEnd) return US_POST;
+  if (usDayMarket(now, q.gmtOff)) return US_DAY;
+  return US_CLOSED;
+}
+
+const char* usSessionLabel(UsSession s) {
+  switch (s) {
+    case US_PRE: return " · 프리마켓";
+    case US_REG: return "";
+    case US_POST: return " · 애프터마켓";
+    case US_DAY: return " · 데이마켓";
+    default: return " · 장 마감";
+  }
+}
+
+// 하루 시세(30분마다): 정규장 가격 · 전날 종가 · 프리/정규/애프터 시간 · 뉴욕 시차
 bool fetchUsMeta(Quote& q, const char* symbol) {
   JsonDocument filter;
   JsonObject m = filter["chart"]["result"][0]["meta"].to<JsonObject>();
+  m["gmtoffset"] = true;
   m["regularMarketPrice"] = true;
   m["chartPreviousClose"] = true;
   m["regularMarketTime"] = true;
@@ -564,6 +597,7 @@ bool fetchUsMeta(Quote& q, const char* symbol) {
   q.regStart = meta["currentTradingPeriod"]["regular"]["start"].as<long>();
   q.regEnd = meta["currentTradingPeriod"]["regular"]["end"].as<long>();
   q.postEnd = meta["currentTradingPeriod"]["post"]["end"].as<long>();
+  q.gmtOff = meta["gmtoffset"] | 0L;
   q.metaOk = true;
   q.metaAt = millis();
   return true;
@@ -574,10 +608,10 @@ bool fetchUs(Quote& q, const char* symbol) {
     if (!fetchUsMeta(q, symbol) && !q.metaOk) return false;
   }
   const time_t now = time(nullptr);
-  const bool pre = timeReady() && now >= q.preStart && now < q.regStart;
-  const bool reg = timeReady() && now >= q.regStart && now <= q.regEnd;
-  const bool post = timeReady() && now > q.regEnd && now <= q.postEnd;
-  q.live = pre || reg || post;
+  const UsSession s = usSession(q, now);
+  const bool reg = s == US_REG;
+  // Yahoo 1분봉이 있는 시간만 1분마다 받는다 - 데이마켓 체결은 토스 웹소켓으로만 온다
+  q.live = s == US_PRE || reg || s == US_POST;
   // 거래 중이면 지금까지, 아니면 지난 애프터마켓 끝(정규장 마감 + 4시간)까지 100분치
   const time_t end = (q.live ? now : q.regTime + 4 * 3600) + 60;
 
@@ -616,13 +650,13 @@ bool fetchUs(Quote& q, const char* symbol) {
     q.price = q.regPrice;
     q.prev = q.regPrev;
     q.at = q.regTime;
-    strcpy(q.session, reg ? "" : " · 장 마감");
+    strcpy(q.session, reg ? "" : s == US_DAY ? usSessionLabel(s) : " · 장 마감");
   } else {
-    // 프리 · 애프터 · 장 밖: 마지막 1분봉 가격, 직전 정규장 종가와 비교
+    // 프리 · 애프터 · 데이 · 장 밖: 마지막 1분봉 가격, 직전 정규장 종가와 비교
     q.price = lastClose;
     q.prev = q.regPrice;
     q.at = lastAt;
-    strcpy(q.session, pre ? " · 프리마켓" : post ? " · 애프터마켓" : " · 장 마감");
+    strcpy(q.session, usSessionLabel(s));
   }
   return true;
 }
@@ -873,6 +907,8 @@ void onTrade(int i, float price, time_t t) {
     c.l = min(c.l, price);
     c.c = price;
   }
+  // 소켓은 30분마다만 새로 붙으니, 애프터 → 데이처럼 시간대가 바뀌면 체결 시각으로 바로 고친다
+  if (!STOCKS[i].kr && q.metaOk) strcpy(q.session, usSessionLabel(usSession(q, t)));
   wsTrades++;
   tradeDirty = true;
 }

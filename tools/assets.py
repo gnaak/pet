@@ -170,7 +170,7 @@ def main():
 
     # 글자 - 화면에 나오는 글자만
     date_chars = "0123456789월일화수목금토요 "
-    foot_chars = "0123456789월일:기준장마감· 불러오는중못받았어요다시시도해요분봉프리애터켓"
+    foot_chars = "0123456789월일:기준장마감· 불러오는중못받았어요다시시도해요분봉프리애터데이켓"
     emit_font("F_CLOCK", "Rajdhani-Bold.ttf", 64, "0123456789:-")
     emit_font("F_PRICE", "Rajdhani-Bold.ttf", 32, "0123456789.,$")
     emit_font("F_NAME_EN", "Rajdhani-Bold.ttf", 18, "SOXL")
